@@ -41,7 +41,7 @@ This keeps Docker simple while still isolating schema and data.
 
 ## Prerequisites
 
-- Node.js `v20+`
+- Node.js `v22+`
 - `pnpm` `v10.28+`
 - Go `v1.26+`
 - Docker

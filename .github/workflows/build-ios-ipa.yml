@@ -1,0 +1,346 @@
+# 云端编译 Multica iOS 无签名 Release 包（Multica.ipa），供 SideStore 导入。
+#
+# 放到 Fork 仓库的 .github/workflows/build-ios-ipa.yml，只能在 Actions 页面手动点 Run workflow 触发。
+#
+# 构建链路与官方 `pnpm ios:mobile:device:prod:release` 相同：
+#   APP_ENV=production + apps/mobile/.env.production → expo prebuild → pod install → xcodebuild Release
+# 区别是不签名、不装到手机，而是把 .app 打成标准 Payload/Multica.app 结构的 Multica.ipa。
+#
+# 版本选择依据（multica-ai/multica @ b5e6204b，2026-11-24）：
+#   - Expo SDK 57（expo 57.0.27）+ React Native 0.86.3，Expo 要求 Xcode 26.4+、iOS 16.4+。
+#   - macos-15 镜像最高只有 Xcode 26.3，不满足要求；macos-26 默认 Xcode 26.6。
+#   - app.config.ts 开启了 buildReactNativeFromSource，React Native 从源码编译，单次 30–60 分钟属正常。
+
+name: Build iOS IPA (unsigned, SideStore)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ios-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Multica.ipa
+    runs-on: macos-26
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    env:
+      XCODE_VERSION: "26.6"
+      APP_ENV: production
+      APP_NAME: Multica
+      EXPECTED_BUNDLE_ID: ai.multica.mobile
+      EXPECTED_API_URL: https://api.multica.ai
+      BUILD_ROOT: ${{ github.workspace }}/build
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 选择 Xcode ${{ env.XCODE_VERSION }}
+        run: |
+          xcode_app="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$xcode_app" ]; then
+            echo "::error::Runner 上没有 ${xcode_app}。请把 XCODE_VERSION 改成下面列表里 26.4 及以上的版本"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode_app/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+          sw_vers
+          df -h /
+
+      # 不写 version，pnpm/action-setup 会读取根目录 package.json 的 packageManager（pnpm@10.28.2）
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 安装 Node.js（版本取自 .nvmrc）
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: 读取生产环境配置 apps/mobile/.env.production
+        working-directory: apps/mobile
+        run: |
+          if [ ! -f .env.production ]; then
+            echo "::error::缺少 apps/mobile/.env.production"
+            exit 1
+          fi
+          api_url="$(sed -n 's/^EXPO_PUBLIC_API_URL=//p' .env.production | tail -n 1)"
+          web_url="$(sed -n 's/^EXPO_PUBLIC_WEB_URL=//p' .env.production | tail -n 1)"
+          echo "EXPO_PUBLIC_API_URL=${api_url}"
+          echo "EXPO_PUBLIC_WEB_URL=${web_url}"
+          if [ "$api_url" != "$EXPECTED_API_URL" ]; then
+            echo "::error::.env.production 里的 API 地址是 '${api_url}'，不是官方 ${EXPECTED_API_URL}，已停止编译"
+            exit 1
+          fi
+          echo "EXPO_PUBLIC_API_URL=${api_url}" >> "$GITHUB_ENV"
+          if [ -n "$web_url" ]; then
+            echo "EXPO_PUBLIC_WEB_URL=${web_url}" >> "$GITHUB_ENV"
+          fi
+          echo "node $(node -v), pnpm $(pnpm -v)"
+
+      - name: 安装 JS 依赖（pnpm install，按 lockfile 锁定版本）
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 iOS 原生工程（expo prebuild）
+        working-directory: apps/mobile
+        run: |
+          pnpm exec expo prebuild --platform ios --no-install
+          pbxproj="ios/${APP_NAME}.xcodeproj/project.pbxproj"
+          if [ ! -f "$pbxproj" ]; then
+            echo "::error::没有生成 ios/${APP_NAME}.xcodeproj（APP_ENV 不是 production 时工程名会变成 MulticaDev 之类）"
+            ls ios
+            exit 1
+          fi
+          grep -E "PRODUCT_BUNDLE_IDENTIFIER|IPHONEOS_DEPLOYMENT_TARGET" "$pbxproj" | sort -u
+          if ! grep -Fq -e "PRODUCT_BUNDLE_IDENTIFIER = \"${EXPECTED_BUNDLE_ID}\";" \
+            -e "PRODUCT_BUNDLE_IDENTIFIER = ${EXPECTED_BUNDLE_ID};" "$pbxproj"; then
+            echo "::error::工程里的 Bundle ID 不是 ${EXPECTED_BUNDLE_ID}"
+            exit 1
+          fi
+          cat ios/Podfile.properties.json
+          printf 'export NODE_BINARY="%s"\n' "$(command -v node)" > ios/.xcode.env.local
+          cat ios/.xcode.env.local
+
+      - name: 安装 CocoaPods 依赖（pod install）
+        working-directory: apps/mobile/ios
+        run: |
+          pod --version
+          pod install || pod install --repo-update
+          if [ ! -d "${APP_NAME}.xcworkspace" ]; then
+            echo "::error::pod install 之后没有 ${APP_NAME}.xcworkspace"
+            exit 1
+          fi
+
+      - name: 编译无签名 Release 真机包（xcodebuild，约 30–60 分钟）
+        working-directory: apps/mobile/ios
+        run: |
+          mkdir -p "$BUILD_ROOT/logs"
+          log="$BUILD_ROOT/logs/xcodebuild.log"
+          echo "完整日志写入 build/logs/xcodebuild.log，失败时会作为 build-logs 附件上传"
+          (
+            while sleep 120; do
+              echo "[$(date '+%H:%M:%S')] 仍在编译，日志已有 $(wc -l < "$log" | tr -d ' ') 行"
+            done
+          ) &
+          heartbeat=$!
+          status=0
+          xcodebuild \
+            -workspace "${APP_NAME}.xcworkspace" \
+            -scheme "${APP_NAME}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$BUILD_ROOT/DerivedData" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build > "$log" 2>&1 || status=$?
+          pkill -P "$heartbeat" sleep 2>/dev/null || true
+          kill "$heartbeat" 2>/dev/null || true
+          if [ "$status" -ne 0 ]; then
+            echo "::error::xcodebuild 编译失败（退出码 ${status}）。下面是报错行和日志最后 150 行"
+            grep -nE "error:|BUILD FAILED|The following build commands failed" "$log" | head -n 60 || true
+            tail -n 150 "$log"
+            exit 1
+          fi
+          tail -n 15 "$log"
+          df -h /
+
+      - name: 打包 Multica.ipa（Payload/Multica.app）
+        run: |
+          app_path="$BUILD_ROOT/DerivedData/Build/Products/Release-iphoneos/${APP_NAME}.app"
+          if [ ! -d "$app_path" ]; then
+            echo "::error::找不到 ${app_path}"
+            ls "$BUILD_ROOT/DerivedData/Build/Products" || true
+            exit 1
+          fi
+          out="$BUILD_ROOT/out"
+          rm -rf "$out"
+          mkdir -p "$out/Payload"
+          ditto "$app_path" "$out/Payload/${APP_NAME}.app"
+          (cd "$out" && zip -qry Multica.ipa Payload)
+          rm -rf "$out/Payload"
+          ls -lh "$out/Multica.ipa"
+
+      - name: 云端自检（结果写入本次运行的 Summary 页）
+        run: |
+          set +e
+          ipa="$BUILD_ROOT/out/Multica.ipa"
+          work="$RUNNER_TEMP/ipa-check"
+          rm -rf "$work"
+          mkdir -p "$work"
+          failures=0
+          rows=""
+          add_row() { rows+="| $1 | $2 | ${3//|//} |"$'\n'; }
+          pass() { add_row "✅" "$1" "$2"; }
+          info() { add_row "ℹ️" "$1" "$2"; }
+          fail() { add_row "❌" "$1" "$2"; failures=$((failures + 1)); echo "::error::$1：$2"; }
+          size_of() {
+            stat -f %z "$1" | awk '{ size = $1; split("B KB MB GB", unit, " "); i = 1;
+              while (size >= 1024 && i < 4) { size /= 1024; i++ }
+              printf "%.1f %s", size, unit[i] }'
+          }
+
+          if [ -s "$ipa" ]; then
+            pass "IPA 文件" "Multica.ipa $(size_of "$ipa")"
+          else
+            fail "IPA 文件" "不存在或为空"
+          fi
+
+          unzip -q "$ipa" -d "$work"
+          app="$work/Payload/${APP_NAME}.app"
+          plist="$app/Info.plist"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist" 2>/dev/null; }
+
+          top_level="$(unzip -Z1 "$ipa" | cut -d/ -f1 | sort -u | tr '\n' ' ')"
+          if [ "$top_level" = "Payload " ] && [ -d "$app" ]; then
+            pass "IPA 结构" "根目录只有 Payload/，内含 ${APP_NAME}.app"
+          else
+            fail "IPA 结构" "根目录是：${top_level:-空}"
+          fi
+
+          bundle="$app/main.jsbundle"
+          if [ -s "$bundle" ]; then
+            pass "离线 JS bundle" "main.jsbundle $(size_of "$bundle")，$(file -b "$bundle" | cut -c1-50)"
+          else
+            fail "离线 JS bundle" "缺少 main.jsbundle，App 启动会去找 Metro，装上也打不开"
+          fi
+
+          if [ -s "$bundle" ] && LC_ALL=C grep -aqF "$EXPECTED_API_URL" "$bundle"; then
+            pass "生产后端" "bundle 内含 ${EXPECTED_API_URL}"
+          else
+            fail "生产后端" "bundle 里找不到 ${EXPECTED_API_URL}"
+          fi
+          if [ -s "$bundle" ] && LC_ALL=C grep -aqF "copilothub" "$bundle"; then
+            fail "非生产后端" "bundle 里出现了 staging 域名 copilothub"
+          else
+            pass "非生产后端" "未发现 staging 域名"
+          fi
+
+          exe="$(pb CFBundleExecutable)"
+          bin="$app/${exe:-$APP_NAME}"
+          lipo_out="$(lipo -info "$bin" 2>&1)"
+          archs="$(lipo -archs "$bin" 2>/dev/null)"
+          if [ "$archs" = "arm64" ]; then
+            pass "CPU 架构" "arm64"
+          else
+            fail "CPU 架构" "期望 arm64，实际：${archs:-读取失败}"
+          fi
+
+          build_version="$(otool -l "$bin" 2>/dev/null | grep -A4 "cmd LC_BUILD_VERSION")"
+          platform="$(printf '%s\n' "$build_version" | awk '$1 == "platform" {print $2; exit}')"
+          case "$platform" in
+            2|IOS) pass "目标平台" "LC_BUILD_VERSION platform=${platform}（IOS 真机）" ;;
+            *) fail "目标平台" "期望 2 / IOS（真机），实际 platform=${platform:-未找到}（7 / IOSSIMULATOR 是模拟器）" ;;
+          esac
+
+          bundle_id="$(pb CFBundleIdentifier)"
+          if [ "$bundle_id" = "$EXPECTED_BUNDLE_ID" ]; then
+            pass "Bundle ID" "$bundle_id"
+          else
+            fail "Bundle ID" "期望 ${EXPECTED_BUNDLE_ID}，实际：${bundle_id:-读取失败}"
+          fi
+          info "最低 iOS 版本" "$(pb MinimumOSVersion)"
+          info "版本号" "$(pb CFBundleShortVersionString)（build $(pb CFBundleVersion)）"
+
+          extensions="$(cd "$app" && find . -name '*.appex' -type d | sed 's|^\./||' | tr '\n' ' ')"
+          if [ -z "$extensions" ] && [ ! -d "$app/PlugIns" ] && [ ! -d "$app/Watch" ]; then
+            pass "App 扩展" "没有 PlugIns/，SideStore 只占 1 个 App ID"
+          else
+            info "App 扩展" "发现：${extensions:-PlugIns/ 或 Watch/ 目录}，SideStore 导入时会额外占用 App ID"
+          fi
+
+          if [ -d "$app/_CodeSignature" ]; then
+            info "签名" "包内带有签名（SideStore 会重签）"
+          else
+            info "签名" "未签名，属正常；SideStore 导入时会用你的 Apple ID 重签"
+          fi
+
+          {
+            echo "## Multica.ipa 自检结果"
+            echo
+            if [ "$failures" -eq 0 ]; then
+              echo "**✅ 全部检查通过，可以在本页底部 Artifacts 下载 Multica-ipa。**"
+            else
+              echo "**❌ 有 ${failures} 项没通过，不要安装这个包。把本页截图发给 Mika。**"
+            fi
+            echo
+            echo "| 结果 | 检查项 | 详情 |"
+            echo "|---|---|---|"
+            printf '%s' "$rows"
+            echo
+            echo "### 构建信息"
+            echo
+            echo "- 源码 commit：\`$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)\`"
+            echo "- $(xcodebuild -version | head -n 1)，node $(node -v)，pnpm $(pnpm -v)，APP_ENV=${APP_ENV}"
+            echo
+            echo "### 原始输出"
+            echo
+            echo '```text'
+            echo "\$ ls -lh Multica.ipa"
+            ls -lh "$ipa"
+            echo
+            echo "\$ unzip -l Multica.ipa（只列关键文件和总数）"
+            unzip -l "$ipa" | grep -E "Payload/${APP_NAME}\.app/(${exe:-$APP_NAME}|main\.jsbundle|Info\.plist)$|PlugIns/|\.appex/|files$"
+            echo
+            echo "\$ lipo -info ${exe:-$APP_NAME}"
+            echo "$lipo_out"
+            echo
+            echo "\$ otool -l ${exe:-$APP_NAME} | grep -A4 LC_BUILD_VERSION"
+            echo "$build_version"
+            echo
+            echo "Info.plist："
+            for key in CFBundleIdentifier CFBundleDisplayName CFBundleName CFBundleExecutable \
+              CFBundleShortVersionString CFBundleVersion MinimumOSVersion DTPlatformName DTSDKName DTXcode; do
+              printf '  %-28s %s\n' "$key" "$(pb "$key")"
+            done
+            echo
+            echo "PlugIns/："
+            ls "$app/PlugIns" 2>/dev/null || echo "  （无）"
+            echo
+            echo "Frameworks/："
+            ls "$app/Frameworks" 2>/dev/null || echo "  （无）"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failures" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: 上传 Multica.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Multica-ipa
+          path: build/out/Multica.ipa
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: 上传编译日志（仅在失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/logs/
+            apps/mobile/ios/Podfile
+            apps/mobile/ios/Podfile.lock
+            apps/mobile/ios/Podfile.properties.json
+          if-no-files-found: ignore
+          retention-days: 7
